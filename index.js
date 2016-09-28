@@ -7,7 +7,6 @@ var uid2 = require('uid2');
 var redis = require('redis').createClient;
 var msgpack = require('msgpack');
 var Adapter = require('socket.io-adapter');
-var Emitter = require('events').EventEmitter;
 var debug = require('debug')('socket.io-redis');
 var async = require('async');
 
@@ -34,24 +33,28 @@ function adapter(uri, opts){
     uri = null;
   }
 
-  // handle uri string
-  if (uri) {
-    uri = uri.split(':');
-    opts.host = uri[0];
-    opts.port = uri[1];
-  }
-
   // opts
-  var host = opts.host || '127.0.0.1';
-  var port = Number(opts.port || 6379);
   var pub = opts.pubClient;
   var sub = opts.subClient;
+
   var prefix = opts.key || 'socket.io';
   var subEvent = opts.subEvent || 'message';
+  var clientsTimeout = opts.clientsTimeout || 1000;
 
   // init clients if needed
-  if (!pub) pub = redis(port, host);
-  if (!sub) sub = redis(port, host, { return_buffers: true });
+  function createClient(redis_opts) {
+    if (uri) {
+      // handle uri string
+      return redis(uri, redis_opts);
+    } else {
+      return redis(opts.port, opts.host, redis_opts);
+    }
+  }
+
+  if (!pub) pub = createClient();
+  if (!sub) sub = createClient({ return_buffers: true });
+
+  var subJson = sub.duplicate({ return_buffers: false });
 
   // this server's key
   var uid = uid2(6);
@@ -68,14 +71,35 @@ function adapter(uri, opts){
 
     this.uid = uid;
     this.prefix = prefix;
+    this.clientsTimeout = clientsTimeout;
+
+    this.channel = prefix + '#' + nsp.name + '#';
+    this.syncChannel = prefix + '-sync#request#' + this.nsp.name + '#';
+
+    if (String.prototype.startsWith) {
+      this.channelMatches = function (messageChannel, subscribedChannel) {
+        return messageChannel.startsWith(subscribedChannel);
+      }
+    } else { // Fallback to other impl for older Node.js
+      this.channelMatches = function (messageChannel, subscribedChannel) {
+        return messageChannel.substr(0, subscribedChannel.length) === subscribedChannel;
+      }
+    }
     this.pubClient = pub;
     this.subClient = sub;
 
     var self = this;
-    sub.subscribe(prefix + '#' + nsp.name + '#', function(err){
+
+    sub.subscribe(this.channel, function(err){
       if (err) self.emit('error', err);
     });
+
+    subJson.subscribe(this.syncChannel, function(err){
+      if (err) self.emit('error', err);
+    });
+
     sub.on(subEvent, this.onmessage.bind(this));
+    subJson.on(subEvent, this.onclients.bind(this));
   }
 
   /**
@@ -91,6 +115,9 @@ function adapter(uri, opts){
    */
 
   Redis.prototype.onmessage = function(channel, msg){
+    if (!this.channelMatches(channel.toString(), this.channel)) {
+      return debug('ignore different channel');
+    }
     var args = msgpack.unpack(msg);
     var packet;
 
@@ -112,6 +139,43 @@ function adapter(uri, opts){
   };
 
   /**
+   * Called with a subscription message on sync
+   *
+   * @api private
+   */
+
+  Redis.prototype.onclients = function(channel, msg){
+
+    var self = this;
+
+    if (!self.channelMatches(channel.toString(), self.syncChannel)) {
+      return debug('ignore different channel');
+    }
+
+    try {
+      var decoded = JSON.parse(msg);
+    } catch(err){
+      self.emit('error', err);
+      return;
+    }
+
+    Adapter.prototype.clients.call(self, decoded.rooms, function(err, clients){
+      if(err){
+        self.emit('error', err);
+        return;
+      }
+
+      var responseChn = prefix + '-sync#response#' + decoded.transaction;
+      var response = JSON.stringify({
+        clients : clients
+      });
+
+      pub.publish(responseChn, response);
+    });
+
+  };
+
+  /**
    * Broadcasts a packet.
    *
    * @param {Object} packet to emit
@@ -121,19 +185,20 @@ function adapter(uri, opts){
    */
 
   Redis.prototype.broadcast = function(packet, opts, remote){
-    Adapter.prototype.broadcast.call(this, packet, opts);
+    packet.nsp = this.nsp.name;
     if (!remote) {
-      var chn = prefix + '#' + packet.nsp + '#';
+      var self = this;
       var msg = msgpack.pack([uid, packet, opts]);
       if (opts.rooms) {
         opts.rooms.forEach(function(room) {
-          var chnRoom = chn + room + '#';
+          var chnRoom = self.channel + room + '#';
           pub.publish(chnRoom, msg);
         });
       } else {
-        pub.publish(chn, msg);
+        pub.publish(self.channel, msg);
       }
     }
+    Adapter.prototype.broadcast.call(this, packet, opts);
   };
 
   /**
@@ -149,7 +214,7 @@ function adapter(uri, opts){
     debug('adding %s to %s ', id, room);
     var self = this;
     Adapter.prototype.add.call(this, id, room);
-    var channel = prefix + '#' + this.nsp.name + '#' + room + '#';
+    var channel = this.channel + room + '#';
     sub.subscribe(channel, function(err){
       if (err) {
         self.emit('error', err);
@@ -177,7 +242,7 @@ function adapter(uri, opts){
     Adapter.prototype.del.call(this, id, room);
 
     if (hasRoom && !this.rooms[room]) {
-      var channel = prefix + '#' + this.nsp.name + '#' + room + '#';
+      var channel = this.channel + room + '#';
       sub.unsubscribe(channel, function(err){
         if (err) {
           self.emit('error', err);
@@ -223,10 +288,93 @@ function adapter(uri, opts){
     });
   };
 
+  /**
+   * Gets a list of clients by sid.
+   *
+   * @param {Array} explicit set of rooms to check.
+   * @api public
+   */
+
+  Redis.prototype.clients = function(rooms, fn){
+    if ('function' == typeof rooms){
+      fn = rooms;
+      rooms = null;
+    }
+
+    rooms = rooms || [];
+
+    var self = this;
+
+    var transaction = uid2(6);
+    var responseChn = prefix + '-sync#response#' + transaction;
+
+    pub.send_command('pubsub', ['numsub', self.syncChannel], function(err, numsub){
+      if (err) {
+        self.emit('error', err);
+        if (fn) fn(err);
+        return;
+      }
+
+      numsub = numsub[1];
+
+      var msg_count = 0;
+      var clients = {};
+
+      subJson.subscribe(responseChn, function(err) {
+        if (err) {
+          self.emit('error', err);
+          if (fn) fn(err);
+          return;
+        }
+
+        var request = JSON.stringify({
+          transaction : transaction,
+          rooms : rooms
+        });
+
+        /*If there is no response for 1 second, return result;*/
+        var timeout = setTimeout(function() {
+          if (fn) process.nextTick(fn.bind(null, null, Object.keys(clients)));
+        }, self.clientsTimeout);
+
+        subJson.on(subEvent, function onEvent(channel, msg) {
+
+          if (!self.channelMatches(channel.toString(), responseChn)) {
+            return debug('ignore different channel');
+          }
+
+          var response = JSON.parse(msg);
+
+          //Ignore if response does not contain 'clients' key
+          if(!response.clients || !Array.isArray(response.clients)) return;
+
+          for(var i = 0; i < response.clients.length; i++){
+            clients[response.clients[i]] = true;
+          }
+
+          msg_count++;
+          if(msg_count == numsub){
+            clearTimeout(timeout);
+            subJson.unsubscribe(responseChn);
+            subJson.removeListener(subEvent, onEvent);
+
+            if (fn) process.nextTick(fn.bind(null, null, Object.keys(clients)));
+          }
+        });
+
+        pub.publish(self.syncChannel, request);
+
+      });
+
+    });
+
+  };
+
   Redis.uid = uid;
   Redis.pubClient = pub;
   Redis.subClient = sub;
   Redis.prefix = prefix;
+  Redis.clientsTimeout = clientsTimeout;
 
   return Redis;
 
